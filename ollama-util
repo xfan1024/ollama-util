@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import sys
 import json
 import argparse
 import shutil
@@ -28,39 +29,33 @@ def parse_model_name(model_name):
     host = 'registry.ollama.ai'
     owner = 'library'
 
-    # Parse host if present
-    if '.' in parts[0]:
+    if len(parts) > 2:
         host = parts[0]
+        owner = parts[1]
+        parts = parts[2:]
+    elif len(parts) > 1:
+        owner = parts[0]
         parts = parts[1:]
 
-    # Parse owner if present
-    if len(parts) > 1:
-        owner = parts[0]
-        model = '/'.join(parts[1:])
-    elif len(parts) == 1:
-        model = parts[0]
-    else:
-        raise ValueError("Empty model name")
+    repo = '/'.join(parts)
 
-    return Path(host) / owner / model / tag
+    if not host or not owner or not repo or not tag:
+        raise ValueError(f"Invalid model name format: {model_name}")
+    return Path(host) / owner / repo / tag
 
 def get_model_files(ollama_dir, model_name):
-    """Retrieve model files with size information"""
-    try:
-        manifest_rel_path = parse_model_name(model_name)
-    except ValueError as e:
-        return None, [], [str(e)]
-
+    """Retrieve model files with validation"""
+    manifest_rel_path = parse_model_name(model_name)
     manifest_path = ollama_dir / 'models' / 'manifests' / manifest_rel_path
 
     if not manifest_path.exists():
-        return None, [], [f"Manifest not found: {manifest_path}"]
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
     try:
         with open(manifest_path, 'r') as f:
             manifest = json.load(f)
-    except Exception as e:
-        return None, [], [f"Invalid manifest: {manifest_path} - {str(e)}"]
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid manifest format: {manifest_path}") from e
 
     file_info = []
     missing_files = []
@@ -84,12 +79,17 @@ def get_model_files(ollama_dir, model_name):
     # Verify physical files
     total_size = 0
     for info in file_info:
-        algo, hash_val = info['digest'].split(':', 1)
+        try:
+            algo, hash_val = info['digest'].split(':', 1)
+        except ValueError:
+            missing_files.append(f"Invalid digest format: {info['digest']}")
+            continue
+
         blob_path = ollama_dir / 'models' / 'blobs' / f"{algo}-{hash_val}"
 
         if blob_path.exists():
             info['path'] = blob_path
-            info['size'] = blob_path.stat().st_size  # Use actual file size
+            info['size'] = blob_path.stat().st_size
         else:
             missing_files.append(str(blob_path))
 
@@ -98,7 +98,7 @@ def get_model_files(ollama_dir, model_name):
     return manifest_path, file_info, missing_files, total_size
 
 def confirm_action(action, files):
-    """Display confirmation prompt with case-insensitive input"""
+    """Display confirmation prompt with validation"""
     print(f"{action} files:")
     for f in files:
         print(f"  {f}")
@@ -106,14 +106,15 @@ def confirm_action(action, files):
     return response == 'y'
 
 def handle_list(args):
-    """List all models with detailed file information"""
+    """List models with validation and error handling"""
     ollama_dir = Path(args.ollama_dir)
     manifests_dir = ollama_dir / 'models' / 'manifests'
 
     if not manifests_dir.exists():
-        print(f"Error: No models found in {ollama_dir}")
-        return
+        print(f"Error: No models found in {ollama_dir}", file=sys.stderr)
+        sys.exit(1)
 
+    exit_code = 0
     for manifest_path in manifests_dir.glob('**/*'):
         if not manifest_path.is_file():
             continue
@@ -121,9 +122,14 @@ def handle_list(args):
         relative_path = manifest_path.relative_to(manifests_dir)
         model_name = f"{relative_path.parent}:{relative_path.name}"
 
-        _, file_info, missing, total_size = get_model_files(ollama_dir, model_name)
-        status = " (INCOMPLETE)" if missing else ""
+        try:
+            _, file_info, missing, total_size = get_model_files(ollama_dir, model_name)
+        except Exception as e:
+            print(f"Error processing {model_name}: {e}", file=sys.stderr)
+            exit_code = 1
+            continue
 
+        status = " (INCOMPLETE)" if missing else ""
         print(f"Model: {model_name}{status}")
         print(f"Total size: {format_size(total_size)}")
 
@@ -132,63 +138,72 @@ def handle_list(args):
             path = info['path'].relative_to(ollama_dir) if info['path'] else info['digest']
             print(f"  {path}: {status}")
 
+        if missing:
+            print(f"Missing files detected", file=sys.stderr)
+
         print()
 
+    sys.exit(exit_code)
+
 def handle_copy_move(args, move=False):
-    """Handle model copy/move operations with validation"""
+    """Handle model transfer operations with error codes"""
     src_dir = Path(args.ollama_dir)
     dst_dir = Path(args.to)
 
-    manifest_path, file_info, missing, _ = get_model_files(src_dir, args.model_name)
-
-    if not manifest_path:
-        print(f"Error: Model {args.model_name} not found")
-        return
+    try:
+        manifest_path, file_info, missing, _ = get_model_files(src_dir, args.model_name)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if missing:
-        print(f"Error: Model {args.model_name} is incomplete")
+        print(f"Error: Model {args.model_name} is incomplete", file=sys.stderr)
         handle_list(argparse.Namespace(ollama_dir=args.ollama_dir))
-        return
+        sys.exit(1)
 
-    # Prepare file list for confirmation
     operation_files = [manifest_path.relative_to(src_dir)]
     operation_files += [info['path'].relative_to(src_dir) for info in file_info if info['path']]
 
     if not confirm_action("Moving" if move else "Copying", operation_files):
-        print("Operation cancelled")
-        return
+        print("Operation cancelled", file=sys.stderr)
+        sys.exit(1)
 
-    # Create destination directories
-    dst_manifest = dst_dir / 'models' / 'manifests' / parse_model_name(args.model_name)
-    dst_manifest.parent.mkdir(parents=True, exist_ok=True)
-    (dst_dir / 'models' / 'blobs').mkdir(parents=True, exist_ok=True)
+    try:
+        dst_manifest = dst_dir / 'models' / 'manifests' / parse_model_name(args.model_name)
+        dst_manifest.parent.mkdir(parents=True, exist_ok=True)
+        (dst_dir / 'models' / 'blobs').mkdir(parents=True, exist_ok=True)
 
-    # Process manifest file
-    if move:
-        shutil.move(str(manifest_path), str(dst_manifest))
-    else:
-        shutil.copy2(str(manifest_path), str(dst_manifest))
-
-    # Process blob files
-    for info in file_info:
-        if not info['path']:
-            continue
-
-        dst_blob = dst_dir / 'models' / 'blobs' / info['path'].name
         if move:
-            if dst_blob.exists():
-                dst_blob.unlink()
-            shutil.move(str(info['path']), str(dst_blob))
+            shutil.move(str(manifest_path), str(dst_manifest))
         else:
-            if not dst_blob.exists():
-                shutil.copy2(str(info['path']), str(dst_blob))
+            shutil.copy2(str(manifest_path), str(dst_manifest))
+
+        for info in file_info:
+            if not info['path']:
+                continue
+
+            dst_blob = dst_dir / 'models' / 'blobs' / info['path'].name
+            if move:
+                if dst_blob.exists():
+                    dst_blob.unlink()
+                shutil.move(str(info['path']), str(dst_blob))
+            else:
+                if not dst_blob.exists():
+                    shutil.copy2(str(info['path']), str(dst_blob))
+
+    except Exception as e:
+        print(f"Operation failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
     print("Operation completed successfully")
+    sys.exit(0)
 
 def main():
-    """Command line interface setup"""
-    parser = argparse.ArgumentParser(prog='ollama-util',
-                                   description='Ollama model management utility')
+    """Main CLI entry point with exit code handling"""
+    parser = argparse.ArgumentParser(
+        prog='ollama-util',
+        description='Ollama model management utility'
+    )
     parser.add_argument('--ollama-dir', required=True,
                        help='Base directory containing Ollama models')
 
@@ -220,6 +235,7 @@ def main():
         args.func(args)
     else:
         parser.print_help()
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
