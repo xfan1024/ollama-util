@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+import os
+import json
+import argparse
+import shutil
+from pathlib import Path
+
+def format_size(size_bytes):
+    """Convert bytes to human-readable format"""
+    units = ['B', 'KB', 'MB', 'GB', 'TB']
+    unit_idx = 0
+    size = float(size_bytes)
+
+    while size >= 1024 and unit_idx < len(units)-1:
+        size /= 1024
+        unit_idx += 1
+
+    precision = 0 if unit_idx == 0 else 1
+    return f"{size:.{precision}f} {units[unit_idx]}"
+
+def parse_model_name(model_name):
+    """Parse model name into structured path components"""
+    if ':' not in model_name:
+        raise ValueError(f"Invalid model name format: {model_name}")
+
+    name_part, tag = model_name.rsplit(':', 1)
+    parts = name_part.split('/')
+    host = 'registry.ollama.ai'
+    owner = 'library'
+
+    # Parse host if present
+    if '.' in parts[0]:
+        host = parts[0]
+        parts = parts[1:]
+
+    # Parse owner if present
+    if len(parts) > 1:
+        owner = parts[0]
+        model = '/'.join(parts[1:])
+    elif len(parts) == 1:
+        model = parts[0]
+    else:
+        raise ValueError("Empty model name")
+
+    return Path(host) / owner / model / tag
+
+def get_model_files(ollama_dir, model_name):
+    """Retrieve model files with size information"""
+    try:
+        manifest_rel_path = parse_model_name(model_name)
+    except ValueError as e:
+        return None, [], [str(e)]
+
+    manifest_path = ollama_dir / 'models' / 'manifests' / manifest_rel_path
+
+    if not manifest_path.exists():
+        return None, [], [f"Manifest not found: {manifest_path}"]
+
+    try:
+        with open(manifest_path, 'r') as f:
+            manifest = json.load(f)
+    except Exception as e:
+        return None, [], [f"Invalid manifest: {manifest_path} - {str(e)}"]
+
+    file_info = []
+    missing_files = []
+
+    # Process config
+    config = manifest.get('config', {})
+    file_info.append({
+        'digest': config.get('digest', ''),
+        'size': config.get('size', 0),
+        'path': None
+    })
+
+    # Process layers
+    for layer in manifest.get('layers', []):
+        file_info.append({
+            'digest': layer.get('digest', ''),
+            'size': layer.get('size', 0),
+            'path': None
+        })
+
+    # Verify physical files
+    total_size = 0
+    for info in file_info:
+        algo, hash_val = info['digest'].split(':', 1)
+        blob_path = ollama_dir / 'models' / 'blobs' / f"{algo}-{hash_val}"
+
+        if blob_path.exists():
+            info['path'] = blob_path
+            info['size'] = blob_path.stat().st_size  # Use actual file size
+        else:
+            missing_files.append(str(blob_path))
+
+        total_size += info['size']
+
+    return manifest_path, file_info, missing_files, total_size
+
+def confirm_action(action, files):
+    """Display confirmation prompt with case-insensitive input"""
+    print(f"{action} files:")
+    for f in files:
+        print(f"  {f}")
+    response = input("Proceed? [y/N] ").strip().lower()
+    return response == 'y'
+
+def handle_list(args):
+    """List all models with detailed file information"""
+    ollama_dir = Path(args.ollama_dir)
+    manifests_dir = ollama_dir / 'models' / 'manifests'
+
+    if not manifests_dir.exists():
+        print(f"Error: No models found in {ollama_dir}")
+        return
+
+    for manifest_path in manifests_dir.glob('**/*'):
+        if not manifest_path.is_file():
+            continue
+
+        relative_path = manifest_path.relative_to(manifests_dir)
+        model_name = f"{relative_path.parent}:{relative_path.name}"
+
+        _, file_info, missing, total_size = get_model_files(ollama_dir, model_name)
+        status = " (INCOMPLETE)" if missing else ""
+
+        print(f"Model: {model_name}{status}")
+        print(f"Total size: {format_size(total_size)}")
+
+        for info in file_info:
+            status = format_size(info['size']) if info['path'] else "not found"
+            path = info['path'].relative_to(ollama_dir) if info['path'] else info['digest']
+            print(f"  {path}: {status}")
+
+        print()
+
+def handle_copy_move(args, move=False):
+    """Handle model copy/move operations with validation"""
+    src_dir = Path(args.ollama_dir)
+    dst_dir = Path(args.to)
+
+    manifest_path, file_info, missing, _ = get_model_files(src_dir, args.model_name)
+
+    if not manifest_path:
+        print(f"Error: Model {args.model_name} not found")
+        return
+
+    if missing:
+        print(f"Error: Model {args.model_name} is incomplete")
+        handle_list(argparse.Namespace(ollama_dir=args.ollama_dir))
+        return
+
+    # Prepare file list for confirmation
+    operation_files = [manifest_path.relative_to(src_dir)]
+    operation_files += [info['path'].relative_to(src_dir) for info in file_info if info['path']]
+
+    if not confirm_action("Moving" if move else "Copying", operation_files):
+        print("Operation cancelled")
+        return
+
+    # Create destination directories
+    dst_manifest = dst_dir / 'models' / 'manifests' / parse_model_name(args.model_name)
+    dst_manifest.parent.mkdir(parents=True, exist_ok=True)
+    (dst_dir / 'models' / 'blobs').mkdir(parents=True, exist_ok=True)
+
+    # Process manifest file
+    if move:
+        shutil.move(str(manifest_path), str(dst_manifest))
+    else:
+        shutil.copy2(str(manifest_path), str(dst_manifest))
+
+    # Process blob files
+    for info in file_info:
+        if not info['path']:
+            continue
+
+        dst_blob = dst_dir / 'models' / 'blobs' / info['path'].name
+        if move:
+            if dst_blob.exists():
+                dst_blob.unlink()
+            shutil.move(str(info['path']), str(dst_blob))
+        else:
+            if not dst_blob.exists():
+                shutil.copy2(str(info['path']), str(dst_blob))
+
+    print("Operation completed successfully")
+
+def main():
+    """Command line interface setup"""
+    parser = argparse.ArgumentParser(prog='ollama-util',
+                                   description='Ollama model management utility')
+    parser.add_argument('--ollama-dir', required=True,
+                       help='Base directory containing Ollama models')
+
+    subparsers = parser.add_subparsers(title='commands')
+
+    # List command
+    list_parser = subparsers.add_parser('ls', aliases=['list'],
+                                      help='List available models')
+    list_parser.set_defaults(func=handle_list)
+
+    # Copy command
+    cp_parser = subparsers.add_parser('cp', aliases=['copy'],
+                                    help='Copy model between repositories')
+    cp_parser.add_argument('model_name', help='Model name to copy')
+    cp_parser.add_argument('--to', required=True,
+                          help='Target ollama directory')
+    cp_parser.set_defaults(func=lambda a: handle_copy_move(a, move=False))
+
+    # Move command
+    mv_parser = subparsers.add_parser('mv', aliases=['move'],
+                                    help='Move model between repositories')
+    mv_parser.add_argument('model_name', help='Model name to move')
+    mv_parser.add_argument('--to', required=True,
+                          help='Target ollama directory')
+    mv_parser.set_defaults(func=lambda a: handle_copy_move(a, move=True))
+
+    args = parser.parse_args()
+    if hasattr(args, 'func'):
+        args.func(args)
+    else:
+        parser.print_help()
+
+if __name__ == '__main__':
+    main()
